@@ -46,4 +46,4 @@ Canvas and SurfaceView. No game engine, no third-party game libraries.
 
 ## Author
 
-Fayaz Ali - Computer Science student
+Fayaz Ali
