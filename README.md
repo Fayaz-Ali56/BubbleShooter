@@ -44,6 +44,5 @@ Canvas and SurfaceView. No game engine, no third-party game libraries.
 3. Let Gradle sync (minimum SDK is API 23 / Android 6.0)
 4. Press Run with a device connected or an emulator started
 
-## Author
-
-Fayaz Ali
+## Developer
+ Fayaz Ali
