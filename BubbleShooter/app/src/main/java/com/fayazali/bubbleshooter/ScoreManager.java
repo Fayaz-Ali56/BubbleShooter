@@ -93,4 +93,33 @@ public class ScoreManager {
         }
         return result;
     }
+
+    public void incrementNightmareSessions() {
+        int sessions = prefs.getInt("nightmare_sessions", 0);
+        prefs.edit().putInt("nightmare_sessions", sessions + 1).apply();
+    }
+
+    public int getNightmareSessions() {
+        return prefs.getInt("nightmare_sessions", 0);
+    }
+
+    public void addMysteryFragments(int count) {
+        int fragments = prefs.getInt("mystery_fragments", 0);
+        prefs.edit().putInt("mystery_fragments", fragments + Math.max(0, count)).apply();
+    }
+
+    public int getMysteryFragments() {
+        return prefs.getInt("mystery_fragments", 0);
+    }
+
+    public void saveNightmarePeakFear(int peakFearPercent) {
+        int best = prefs.getInt("best_peak_fear", 0);
+        if (peakFearPercent > best) {
+            prefs.edit().putInt("best_peak_fear", peakFearPercent).apply();
+        }
+    }
+
+    public int getBestPeakFear() {
+        return prefs.getInt("best_peak_fear", 0);
+    }
 }

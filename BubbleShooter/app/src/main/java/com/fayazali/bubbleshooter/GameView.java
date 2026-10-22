@@ -11,6 +11,7 @@ import android.view.SurfaceView;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
 /**
  * The heart of the game. Draws every screen, handles touch input, and owns
@@ -29,6 +30,17 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
     private static final int MAX_LEVEL = 200;
     private static final int MAX_LIVES = 3;
     private static final float TOP_WALL = 130f;
+    private static final float SESSION_TARGET_MINUTES = 12f;
+
+    private static final int INTENSITY_CALM = 0;
+    private static final int INTENSITY_STANDARD = 1;
+    private static final int INTENSITY_RELENTLESS = 2;
+
+    private static final int EVENT_NONE = 0;
+    private static final int EVENT_BLACKOUT = 1;
+    private static final int EVENT_WHIRL = 2;
+    private static final int EVENT_HUNTER_PUSH = 3;
+    private static final int EVENT_WHISPER_HINT = 4;
 
     private int state = STATE_START;
 
@@ -52,6 +64,41 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
     // level select scrolling
     private float levelSelectScrollY = 0;
     private float lastTouchY = 0;
+
+    // nightmare direction + adaptive fear systems
+    private static final String FEAR_THEME = "Psychological dread through isolation and pursuit";
+    private static final String TARGET_AUDIENCE = "Horror fans (16+) who enjoy 8-15 minute mobile runs";
+    private static final String[] UNIQUE_PILLARS = {
+            "Sound-first threat cues",
+            "Sanity distortion visuals",
+            "Unpredictable social whispers"
+    };
+    private static final String[] RETURN_HOOKS = {
+            "Daily anomaly rotation",
+            "Unlockable endings from mystery fragments",
+            "Dynamic event combinations per run"
+    };
+
+    private final Random random = new Random();
+    private int fearIntensity = INTENSITY_STANDARD;
+    private boolean comfortMode = false;
+    private float tension = 0.2f;
+    private float fear = 0.15f;
+    private float peakFear = 0f;
+    private long sessionStartMs = 0L;
+    private long sessionLastActionMs = 0L;
+    private long nextEventAtMs = 0L;
+    private long eventEndAtMs = 0L;
+    private long scareCooldownUntilMs = 0L;
+    private int activeEvent = EVENT_NONE;
+    private int anomaliesSeen = 0;
+    private int mysteryFragmentsEarned = 0;
+    private float blackoutAlpha = 0f;
+    private float swirlShift = 0f;
+    private String whisperText = "";
+    private int shotsFired = 0;
+    private int shotsResolved = 0;
+    private int successfulResolutions = 0;
 
     private Paint bgPaint, textPaint, titlePaint, namePaint;
     private Paint btnPaint, btnTextPaint, overlayPaint, scorePaint;
@@ -109,9 +156,47 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         hudBgPaint.setColor(Color.parseColor("#AA000000"));
     }
 
+    private float intensityMultiplier() {
+        if (fearIntensity == INTENSITY_CALM) return 0.65f;
+        if (fearIntensity == INTENSITY_RELENTLESS) return 1.3f;
+        return 1f;
+    }
+
+    private String intensityName() {
+        if (fearIntensity == INTENSITY_CALM) return "CALM";
+        if (fearIntensity == INTENSITY_RELENTLESS) return "RELENTLESS";
+        return "STANDARD";
+    }
+
+    private void cycleIntensity() {
+        fearIntensity = (fearIntensity + 1) % 3;
+    }
+
+    private void prepareNightmareRun() {
+        long now = System.currentTimeMillis();
+        sessionStartMs = now;
+        sessionLastActionMs = now;
+        scareCooldownUntilMs = now + 3500L;
+        nextEventAtMs = now + (long) ((9000 + random.nextInt(6500)) / intensityMultiplier());
+        eventEndAtMs = 0;
+        activeEvent = EVENT_NONE;
+        anomaliesSeen = 0;
+        mysteryFragmentsEarned = 0;
+        tension = 0.2f;
+        fear = 0.15f;
+        peakFear = 0f;
+        blackoutAlpha = 0f;
+        swirlShift = 0f;
+        whisperText = "";
+        shotsFired = 0;
+        shotsResolved = 0;
+        successfulResolutions = 0;
+        scoreManager.incrementNightmareSessions();
+    }
+
     // ---- game setup ----------------------------------------------------
 
-    private void initGame() {
+    private void initGame(boolean resetSession) {
         bubbleRadius = screenWidth / (GridManager.COLS * 2.2f);
         float gridStartX = screenWidth / 2f - (GridManager.COLS / 2f) * bubbleRadius * 2.1f;
 
@@ -127,11 +212,16 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         fallingBubbles.clear();
         shotCount = 0;
         shotsUntilNewRow = Math.max(5, 12 - level / 10);
+        if (resetSession) {
+            prepareNightmareRun();
+        }
     }
 
     // ---- update --------------------------------------------------------
 
     public void update() {
+        long now = System.currentTimeMillis();
+
         // falling bubbles keep animating on every screen
         List<Bubble> doneFalling = new ArrayList<>();
         for (Bubble b : fallingBubbles) {
@@ -140,7 +230,13 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         }
         fallingBubbles.removeAll(doneFalling);
 
+        if (state == STATE_PLAYING) {
+            updateAmbientFear(now);
+        }
+
         if (state != STATE_PLAYING || gridManager == null) return;
+
+        maybeTriggerAdaptiveEvent(now);
 
         List<Bubble> toRemove = new ArrayList<>();
         for (Bubble b : movingBubbles) {
@@ -179,6 +275,9 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
 
             if (b.y > screenHeight) toRemove.add(b);
         }
+        if (!toRemove.isEmpty()) {
+            shotsResolved += toRemove.size();
+        }
         movingBubbles.removeAll(toRemove);
 
         // level cleared
@@ -195,10 +294,81 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
             if (lives <= 0) {
                 scoreManager.saveScore(score, level);
                 state = STATE_GAMEOVER;
+                finishNightmareRun();
             } else {
-                initGame(); // same level, one life fewer
+                initGame(false); // same level, one life fewer
             }
         }
+    }
+
+    private void updateAmbientFear(long now) {
+        float pressureFromLives = (MAX_LIVES - lives) / (float) MAX_LIVES;
+        float pressureFromGrid = gridManager != null && gridManager.isBubbleAtBottom(screenHeight - 310) ? 0.25f : 0f;
+        float silencePressure = Math.min(0.2f, (now - sessionLastActionMs) / 25000f);
+        float targetTension = 0.18f + pressureFromLives * 0.45f + pressureFromGrid + silencePressure;
+        targetTension *= intensityMultiplier();
+        targetTension = Math.max(0.05f, Math.min(1f, targetTension));
+        tension += (targetTension - tension) * 0.06f;
+
+        float aimSkill = shotsResolved == 0 ? 0.5f : (successfulResolutions / (float) Math.max(1, shotsResolved));
+        float unpredictability = 0.15f + (float) Math.abs(Math.sin(now * 0.0012)) * 0.25f;
+        float targetFear = (tension * 0.65f) + (1f - aimSkill) * 0.22f + unpredictability;
+        if (comfortMode) targetFear -= 0.15f;
+        fear += (Math.max(0f, Math.min(1f, targetFear)) - fear) * 0.08f;
+        peakFear = Math.max(peakFear, fear);
+
+        if (activeEvent == EVENT_BLACKOUT) {
+            blackoutAlpha = Math.min(0.75f, blackoutAlpha + 0.035f);
+        } else {
+            blackoutAlpha = Math.max(0f, blackoutAlpha - 0.03f);
+        }
+
+        if (activeEvent == EVENT_WHIRL) {
+            swirlShift = (float) Math.sin(now * 0.013) * 8f * intensityMultiplier();
+        } else {
+            swirlShift *= 0.9f;
+        }
+
+        if (activeEvent != EVENT_WHISPER_HINT) {
+            whisperText = "";
+        }
+    }
+
+    private void maybeTriggerAdaptiveEvent(long now) {
+        if (now >= eventEndAtMs && activeEvent != EVENT_NONE) {
+            activeEvent = EVENT_NONE;
+        }
+
+        if (now < nextEventAtMs || now < scareCooldownUntilMs || activeEvent != EVENT_NONE) return;
+        if (lives == 1 && gridManager.isBubbleAtBottom(screenHeight - 320)) return;
+
+        int pick = random.nextInt(4);
+        activeEvent = pick == 0 ? EVENT_BLACKOUT
+                : pick == 1 ? EVENT_WHIRL
+                : pick == 2 ? EVENT_HUNTER_PUSH
+                : EVENT_WHISPER_HINT;
+
+        anomaliesSeen++;
+        mysteryFragmentsEarned++;
+        scoreManager.addMysteryFragments(1);
+
+        if (activeEvent == EVENT_HUNTER_PUSH) {
+            gridManager.addRow();
+            if (!comfortMode && fearIntensity != INTENSITY_CALM) {
+                gridManager.addRow();
+            }
+        } else if (activeEvent == EVENT_WHISPER_HINT) {
+            whisperText = random.nextBoolean() ? "You heard breathing on the left..." : "A whisper says: don't trust the center.";
+        }
+
+        eventEndAtMs = now + (long) (2600 + random.nextInt(2200));
+        scareCooldownUntilMs = now + (long) (6500 / intensityMultiplier());
+        nextEventAtMs = eventEndAtMs + (long) ((9000 + random.nextInt(7000)) / intensityMultiplier());
+    }
+
+    private void finishNightmareRun() {
+        int fearPercent = Math.round(peakFear * 100f);
+        scoreManager.saveNightmarePeakFear(fearPercent);
     }
 
     private void snapBubble(Bubble b) {
@@ -210,12 +380,14 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         b.y = gridManager.getBubbleY(row);
         b.isMoving = false;
         gridManager.grid[row][col] = b;
+        boolean positiveOutcome = false;
 
         if (b.type == Bubble.TYPE_BOMB) {
             for (int[] t : gridManager.findBombTargets(row, col)) {
                 startFalling(gridManager.grid[t[0]][t[1]]);
                 gridManager.grid[t[0]][t[1]] = null;
                 score += 15;
+                positiveOutcome = true;
             }
             gridManager.grid[row][col] = null;
         } else {
@@ -225,6 +397,7 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
                     startFalling(gridManager.grid[m[0]][m[1]]);
                     gridManager.grid[m[0]][m[1]] = null;
                     score += 10;
+                    positiveOutcome = true;
                 }
                 score += matches.size() * 5;
 
@@ -232,8 +405,17 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
                     startFalling(gridManager.grid[f[0]][f[1]]);
                     gridManager.grid[f[0]][f[1]] = null;
                     score += 15;
+                    positiveOutcome = true;
                 }
             }
+        }
+
+        if (positiveOutcome) {
+            successfulResolutions++;
+            tension = Math.max(0.05f, tension - 0.07f);
+            fear = Math.max(0.05f, fear - 0.05f);
+        } else {
+            tension = Math.min(1f, tension + 0.04f * intensityMultiplier());
         }
 
         shotCount++;
@@ -326,13 +508,32 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         canvas.drawRoundRect(new RectF(cx - 180, cy + 275, cx + 180, cy + 355), 50, 50, btnPaint);
         canvas.drawText("HOW TO PLAY", cx, cy + 338, btnTextPaint);
 
+        btnPaint.setColor(Color.parseColor("#5D4037"));
+        canvas.drawRoundRect(new RectF(cx - 180, cy + 365, cx + 180, cy + 435), 38, 38, btnPaint);
+        btnTextPaint.setTextSize(34);
+        canvas.drawText("INTENSITY: " + intensityName(), cx, cy + 412, btnTextPaint);
+
+        btnPaint.setColor(comfortMode ? Color.parseColor("#2E7D32") : Color.parseColor("#616161"));
+        canvas.drawRoundRect(new RectF(cx - 180, cy + 445, cx + 180, cy + 515), 38, 38, btnPaint);
+        canvas.drawText("COMFORT: " + (comfortMode ? "ON" : "OFF"), cx, cy + 492, btnTextPaint);
+
         textPaint.setTextSize(36);
         textPaint.setColor(Color.parseColor("#FFD700"));
-        canvas.drawText("Best Score: " + scoreManager.getHighScore(), cx, cy + 400, textPaint);
+        canvas.drawText("Best Score: " + scoreManager.getHighScore(), cx, cy + 555, textPaint);
 
         textPaint.setColor(Color.parseColor("#4CAF50"));
         canvas.drawText("Reached Level: " + scoreManager.getHighestUnlockedLevel(),
-                cx, cy + 450, textPaint);
+                cx, cy + 600, textPaint);
+
+        textPaint.setTextSize(24);
+        textPaint.setColor(Color.parseColor("#BBBBBB"));
+        canvas.drawText("Theme: " + FEAR_THEME, cx, cy + 640, textPaint);
+        canvas.drawText("Audience: " + TARGET_AUDIENCE, cx, cy + 675, textPaint);
+        canvas.drawText("Session target: ~" + (int) SESSION_TARGET_MINUTES + " mins", cx, cy + 710, textPaint);
+        canvas.drawText("Mystery fragments: " + scoreManager.getMysteryFragments(), cx, cy + 745, textPaint);
+        canvas.drawText("Best fear peak: " + scoreManager.getBestPeakFear() + "%", cx, cy + 780, textPaint);
+        canvas.drawText("Return hook today: " + RETURN_HOOKS[(int) (System.currentTimeMillis() / 86400000L) % RETURN_HOOKS.length],
+                cx, cy + 815, textPaint);
 
         textPaint.setTextSize(24);
         textPaint.setColor(Color.parseColor("#555555"));
@@ -443,22 +644,22 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         canvas.drawText("BACK", 70, 64, textPaint);
 
         String[] titles = {
-                "AIM AND SHOOT",
-                "MATCH 3 BUBBLES",
-                "SWAP BUBBLES",
-                "USE BOMBS",
-                "BANK YOUR SHOTS",
-                "3 LIVES PER LEVEL",
-                "LEVEL PROGRESSION"
+                "EMOTIONAL LOOP",
+                "UNIQUE PILLARS",
+                "SOUND + ATMOSPHERE",
+                "ADAPTIVE FEAR",
+                "FAIRNESS FIRST",
+                "RETENTION HOOKS",
+                "ANDROID VERTICAL SLICE"
         };
         String[] descs = {
-                "Drag your finger to aim, then lift it to fire the bubble.",
-                "Match 3 or more bubbles of the same colour to pop them.",
-                "Tap the SWAP button to switch the current and next bubble.",
-                "Bombs destroy every bubble in a wide area around them.",
-                "The aim line bounces off walls so you can reach tight spots.",
-                "You get 3 lives on each level. Lose all 3 and it is game over.",
-                "Beat a level to unlock the next. Replay any level you finished."
+                "Tension -> uncertainty -> scare/relief -> curiosity repeats each run.",
+                UNIQUE_PILLARS[0] + ", " + UNIQUE_PILLARS[1] + ", " + UNIQUE_PILLARS[2] + ".",
+                "Silence, distant cues and blackout pulses push psychological dread.",
+                "The game reads your pressure and changes anomaly timing every session.",
+                "Intensity + comfort toggles keep fear readable instead of unfair.",
+                RETURN_HOOKS[0] + ", " + RETURN_HOOKS[1] + ", " + RETURN_HOOKS[2] + ".",
+                "Built for low-end phones with short sessions and responsive controls."
         };
         int[] colors = {
                 0xFF2196F3, 0xFFFF6B9D, 0xFF4CAF50,
@@ -509,17 +710,27 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
     private void drawGameScreen(Canvas canvas) {
         if (gridManager == null || shooter == null) return;
 
+        canvas.save();
+        if (activeEvent == EVENT_WHIRL && !comfortMode) {
+            canvas.translate(swirlShift, 0);
+        }
+
         canvas.drawRect(0, 0, screenWidth, 120, hudBgPaint);
 
         scorePaint.setTextAlign(Paint.Align.LEFT);
         scorePaint.setColor(Color.WHITE);
-        scorePaint.setTextSize(38);
+        scorePaint.setTextSize(34);
         canvas.drawText("Score: " + score, 20, 70, scorePaint);
+        scorePaint.setTextSize(24);
+        canvas.drawText("Fear " + Math.round(fear * 100) + "%", 20, 102, scorePaint);
 
         scorePaint.setTextAlign(Paint.Align.CENTER);
         scorePaint.setColor(Color.parseColor("#FF6B9D"));
-        scorePaint.setTextSize(46);
+        scorePaint.setTextSize(40);
         canvas.drawText("Level " + level, screenWidth / 2f, 70, scorePaint);
+        scorePaint.setTextSize(24);
+        scorePaint.setColor(Color.parseColor("#AAAAAA"));
+        canvas.drawText("Anomalies " + anomaliesSeen, screenWidth / 2f, 102, scorePaint);
 
         // hearts for remaining lives
         drawHearts(canvas);
@@ -536,6 +747,22 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
         wm.setTextSize(20);
         wm.setTextAlign(Paint.Align.CENTER);
         canvas.drawText("by Fayaz Ali", screenWidth / 2f, screenHeight - 8, wm);
+        canvas.restore();
+
+        if (blackoutAlpha > 0.01f) {
+            Paint black = new Paint();
+            int maxAlpha = comfortMode ? 110 : 180;
+            black.setColor(Color.argb((int) Math.min(maxAlpha, blackoutAlpha * 255), 0, 0, 0));
+            canvas.drawRect(0, 0, screenWidth, screenHeight, black);
+        }
+
+        if (!whisperText.isEmpty()) {
+            Paint whisper = new Paint(Paint.ANTI_ALIAS_FLAG);
+            whisper.setColor(Color.parseColor("#CCB39DDB"));
+            whisper.setTextAlign(Paint.Align.CENTER);
+            whisper.setTextSize(30);
+            canvas.drawText(whisperText, screenWidth / 2f, screenHeight - 310, whisper);
+        }
     }
 
     private void drawHearts(Canvas canvas) {
@@ -647,10 +874,17 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
             canvas.drawText(scores.get(i), cx, cy + 15 + i * 42, textPaint);
         }
 
+        textPaint.setTextSize(28);
+        textPaint.setColor(Color.parseColor("#90CAF9"));
+        canvas.drawText("Peak Fear: " + Math.round(peakFear * 100) + "%", cx, cy + 250, textPaint);
+        textPaint.setColor(Color.parseColor("#CE93D8"));
+        canvas.drawText("Run anomalies: " + anomaliesSeen + "  |  Fragments +" + mysteryFragmentsEarned,
+                cx, cy + 285, textPaint);
+
         btnPaint.setColor(Color.parseColor("#FF6B9D"));
-        canvas.drawRoundRect(new RectF(cx - 180, cy + 235, cx + 180, cy + 325), 50, 50, btnPaint);
+        canvas.drawRoundRect(new RectF(cx - 180, cy + 315, cx + 180, cy + 405), 50, 50, btnPaint);
         btnTextPaint.setTextSize(48);
-        canvas.drawText("MAIN MENU", cx, cy + 298, btnTextPaint);
+        canvas.drawText("MAIN MENU", cx, cy + 378, btnTextPaint);
 
         namePaint.setTextSize(32);
         canvas.drawText("by Fayaz Ali", cx, screenHeight - 30, namePaint);
@@ -695,12 +929,16 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
                 lives = MAX_LIVES;
                 score = 0;
                 state = STATE_PLAYING;
-                initGame();
+                initGame(true);
             } else if (inBox(tx, ty, cx - 180, cy + 175, cx + 180, cy + 255)) {
                 levelSelectScrollY = 0;
                 state = STATE_LEVEL_SELECT;
             } else if (inBox(tx, ty, cx - 180, cy + 275, cx + 180, cy + 355)) {
                 state = STATE_HOW_TO_PLAY;
+            } else if (inBox(tx, ty, cx - 180, cy + 365, cx + 180, cy + 435)) {
+                cycleIntensity();
+            } else if (inBox(tx, ty, cx - 180, cy + 445, cx + 180, cy + 515)) {
+                comfortMode = !comfortMode;
             }
 
         } else if (state == STATE_LEVEL_SELECT) {
@@ -720,7 +958,7 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
                     lives = MAX_LIVES;
                     score = 0;
                     state = STATE_PLAYING;
-                    initGame();
+                    initGame(true);
                     return;
                 }
             }
@@ -732,11 +970,18 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
             if (shooter == null) return;
             if (shooter.isSwapButtonTapped(tx, ty)) {
                 shooter.swapBubbles();
+                sessionLastActionMs = System.currentTimeMillis();
                 return;
             }
             if (ty < shooter.y - 50) {
+                float jitter = comfortMode ? 0f : (fear * 0.07f * intensityMultiplier());
+                shooter.angle += (random.nextFloat() - 0.5f) * jitter;
                 Bubble shot = shooter.shoot();
-                if (shot != null) movingBubbles.add(shot);
+                if (shot != null) {
+                    movingBubbles.add(shot);
+                    shotsFired++;
+                    sessionLastActionMs = System.currentTimeMillis();
+                }
             }
 
         } else if (state == STATE_LEVEL_WIN) {
@@ -745,11 +990,11 @@ public class GameView extends SurfaceView implements SurfaceHolder.Callback {
                 lives = MAX_LIVES;
                 scoreManager.saveCurrentLevel(level);
                 state = STATE_PLAYING;
-                initGame();
+                initGame(true);
             }
 
         } else if (state == STATE_GAMEOVER) {
-            if (inBox(tx, ty, cx - 180, cy + 235, cx + 180, cy + 325)) {
+            if (inBox(tx, ty, cx - 180, cy + 315, cx + 180, cy + 405)) {
                 state = STATE_START;
             }
         }

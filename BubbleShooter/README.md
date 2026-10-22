@@ -17,6 +17,12 @@ Canvas and SurfaceView. No game engine, no third-party game libraries.
 - Top 5 high scores saved on the device
 - Built-in "How to Play" guide
 - Progress saved with SharedPreferences
+- Nightmare mode direction built into gameplay:
+  - Psychological dread theme tuned for short (8-15 min) mobile sessions
+  - Emotional loop of tension → uncertainty → scare/relief → curiosity
+  - Adaptive anomalies (blackouts, whispers, hunter pushes, distortion) that vary each run
+  - Fear intensity levels (Calm / Standard / Relentless) and a Comfort toggle for fairness
+  - Mystery fragment progression and peak fear tracking for replay motivation
 
 ## Built With
 
